@@ -3,8 +3,9 @@
 // standards (§15). Exit 1 on any failure.
 import { chromium } from "playwright";
 import http from "node:http";
-import { readFileSync, existsSync, statSync } from "node:fs";
+import { readFileSync, existsSync, statSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 const ROOT = process.cwd();
 const PORT = Number(process.env.PORT) || 8099;
@@ -50,6 +51,14 @@ const hook = (page) => {
   page.on("pageerror", (e) => errs.push(String(e)));
 };
 
+// openEpub(buf, name) calls syncQueryName(name) before it ever tries
+// JSZip.loadAsync(), so a fixture that fails to unzip (caught inside the
+// promise chain, which shows an honest toast) still exercises the ?name=
+// write path -- this does NOT need to be a real, valid EPUB.
+const FIX = mkdtempSync(join(tmpdir(), "epub-harness-"));
+const FIXTURE_EPUB = join(FIX, "sample.epub");
+writeFileSync(FIXTURE_EPUB, "not a real epub");
+
 // -- main context: light system scheme, full toggle round-trip
 const ctx = await browser.newContext({ colorScheme: "light", viewport: { width: 1240, height: 800 } });
 const page = await ctx.newPage();
@@ -82,7 +91,37 @@ check("icons in dark mode (moon shown, sun hidden)", await page.evaluate(() => {
 check("choice persists (mykk-bg)", await page.evaluate(() => { try { return localStorage.getItem("mykk-bg") === "#0d1117"; } catch (e) { return false; } }));
 await page.click("#themeToggle");
 check("toggle back to light", await page.evaluate(() => document.getElementById("bgPicker").value) === "#ffffff");
+
+// -- ?name=: loading a file reflects its name into the URL, Clear removes it
+await page.setInputFiles("#fileInput", FIXTURE_EPUB);
+await page.waitForFunction(() =>
+  new URLSearchParams(location.search).get("name") === "sample.epub", null, { timeout: 10000 });
+check("load: URL reflects ?name=sample.epub", await page.evaluate(() =>
+  new URLSearchParams(location.search).get("name")) === "sample.epub");
+await page.click("#btnClear");
+check("clear: ?name= removed from the URL", await page.evaluate(() =>
+  new URLSearchParams(location.search).get("name")) === null);
 await ctx.close();
+
+// -- direct visit with ?name=: empty-state names the last-viewed file
+const p3 = await browser.newContext().then((c) => c.newPage());
+hook(p3);
+await p3.goto(`http://localhost:${PORT}/?name=${encodeURIComponent("sample.epub")}`, { waitUntil: "load", timeout: 30000 });
+check("?name=: 'shared for' sub-line names the file", await p3.evaluate(() =>
+  /shared for/.test(document.querySelector(".empty-sub").textContent) &&
+  /sample\.epub/.test(document.querySelector(".empty-sub").textContent)));
+await p3.context().close();
+
+// -- ?name= carrying markup renders as TEXT, never parsed as HTML
+const p4 = await browser.newContext().then((c) => c.newPage());
+hook(p4);
+const HOSTILE_NAME = "<img src=x onerror=alert(1)>.epub";
+await p4.goto(`http://localhost:${PORT}/?name=${encodeURIComponent(HOSTILE_NAME)}`, { waitUntil: "load", timeout: 30000 });
+check("?name=: hostile markup shows as literal text, never parsed", await p4.evaluate((name) => {
+  const sub = document.querySelector(".empty-sub");
+  return sub.textContent.includes(name) && sub.querySelector("img") === null;
+}, HOSTILE_NAME));
+await p4.context().close();
 
 // -- fresh context with dark system scheme: must default dark
 const ctx2 = await browser.newContext({ colorScheme: "dark" });
