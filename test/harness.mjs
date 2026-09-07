@@ -6,6 +6,7 @@ import http from "node:http";
 import { readFileSync, existsSync, statSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { crc32 } from "node:zlib";
 
 const ROOT = process.cwd();
 const PORT = Number(process.env.PORT) || 8099;
@@ -58,6 +59,73 @@ const hook = (page) => {
 const FIX = mkdtempSync(join(tmpdir(), "epub-harness-"));
 const FIXTURE_EPUB = join(FIX, "sample.epub");
 writeFileSync(FIXTURE_EPUB, "not a real epub");
+
+// -- Hostile EPUB fixture for the DOMPurify pass in renderChapter().
+// Built here rather than committed as a binary so the payloads stay readable
+// in review: a security fixture nobody can inspect is a poor security fixture.
+// Store-only ZIP (method 0) — no compression, so the writer is ~30 lines and
+// JSZip reads it fine.
+const zipStore = (entries) => {
+  const locals = [], central = [];
+  let off = 0;
+  for (const [name, body] of entries) {
+    const nb = Buffer.from(name, "utf8");
+    const db = Buffer.isBuffer(body) ? body : Buffer.from(body, "utf8");
+    const crc = crc32(db);
+    const lf = Buffer.alloc(30);
+    lf.writeUInt32LE(0x04034b50, 0); lf.writeUInt16LE(20, 4); lf.writeUInt16LE(0, 6);
+    lf.writeUInt16LE(0, 8); lf.writeUInt16LE(0, 10); lf.writeUInt16LE(0, 12);
+    lf.writeUInt32LE(crc, 14); lf.writeUInt32LE(db.length, 18); lf.writeUInt32LE(db.length, 22);
+    lf.writeUInt16LE(nb.length, 26); lf.writeUInt16LE(0, 28);
+    locals.push(lf, nb, db);
+    const cd = Buffer.alloc(46);
+    cd.writeUInt32LE(0x02014b50, 0); cd.writeUInt16LE(20, 4); cd.writeUInt16LE(20, 6);
+    cd.writeUInt16LE(0, 8); cd.writeUInt16LE(0, 10); cd.writeUInt16LE(0, 12); cd.writeUInt16LE(0, 14);
+    cd.writeUInt32LE(crc, 16); cd.writeUInt32LE(db.length, 20); cd.writeUInt32LE(db.length, 24);
+    cd.writeUInt16LE(nb.length, 28); cd.writeUInt16LE(0, 30); cd.writeUInt16LE(0, 32);
+    cd.writeUInt16LE(0, 34); cd.writeUInt16LE(0, 36); cd.writeUInt32LE(0, 38);
+    cd.writeUInt32LE(off, 42);
+    central.push(cd, nb);
+    off += lf.length + nb.length + db.length;
+  }
+  const cdBuf = Buffer.concat(central);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(entries.length, 8); eocd.writeUInt16LE(entries.length, 10);
+  eocd.writeUInt32LE(cdBuf.length, 12); eocd.writeUInt32LE(off, 16);
+  return Buffer.concat([Buffer.concat(locals), cdBuf, eocd]);
+};
+
+const HOSTILE_CHAPTER = `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Ch1</title></head><body>
+<h1 id="ok-heading">Chapter One</h1>
+<script>window.__xssScript = true;<\/script>
+<img id="x-onerror" src="missing.png" onerror="window.__xssImg = true"/>
+<a id="x-js" href="javascript:void(window.__xssHref = true)">js link</a>
+<iframe id="x-frame" src="about:blank"></iframe>
+<p id="x-click" onclick="window.__xssClick = true">handler</p>
+<style id="x-style">body{color:red}</style>
+<form id="x-form"><input id="x-input"/><button id="x-button">go</button></form>
+<p id="x-styled" style="color:red">styled</p>
+<img id="x-remote" src="https://example.com/beacon.png"/>
+<img id="x-srcset" src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" srcset="https://example.com/b.png 1x"/>
+<img id="x-data" src="data:image/gif;base64,R0lGODlhAQABAAAAACw="/>
+</body></html>`;
+
+const HOSTILE_EPUB = join(FIX, "hostile.epub");
+writeFileSync(HOSTILE_EPUB, zipStore([
+  ["mimetype", "application/epub+zip"],
+  ["META-INF/container.xml",
+   `<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+    <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>`],
+  ["OEBPS/content.opf",
+   `<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+    <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Hostile Fixture</dc:title>
+    <dc:creator>Harness</dc:creator><dc:identifier id="id">urn:uuid:test</dc:identifier></metadata>
+    <manifest><item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/></manifest>
+    <spine><itemref idref="c1"/></spine></package>`],
+  ["OEBPS/ch1.xhtml", HOSTILE_CHAPTER],
+]));
 
 // -- main context: light system scheme, full toggle round-trip
 const ctx = await browser.newContext({ colorScheme: "light", viewport: { width: 1240, height: 800 } });
@@ -130,6 +198,69 @@ hook(p2);
 await p2.goto(`http://localhost:${PORT}/`, { waitUntil: "load", timeout: 30000 });
 check("system-dark default (#0d1117)", await p2.evaluate(() => document.getElementById("bgPicker").value) === "#0d1117");
 await ctx2.close();
+
+// -- the document sink: DOMParser -> DOMPurify -> #content, in renderChapter().
+// Distinct from the ?name= sink above, which lands in .empty-sub and is NOT
+// sanitized. Every assertion here is written to fail when DOMPurify is removed
+// -- but this repo fails in the OPPOSITE direction from markdown-viewer.us:
+// its sanitize() call is a ternary whose else-branch is "", so a missing
+// DOMPurify renders NOTHING rather than rendering unsanitized. That makes every
+// "hostile element is absent" assertion pass vacuously, and the two POSITIVE
+// assertions -- the heading guard and the data: image -- are the only things
+// that catch it. They are the load-bearing checks here.
+const ctxX = await browser.newContext();
+const px = await ctxX.newPage();
+hook(px);
+await px.goto(`http://localhost:${PORT}/`, { waitUntil: "load", timeout: 30000 });
+await px.setInputFiles("#fileInput", HOSTILE_EPUB);
+await px.waitForFunction(() => {
+  const c = document.getElementById("content");
+  return c && c.querySelector("#ok-heading");
+}, null, { timeout: 15000 }).catch(() => {});
+
+check("hostile book actually rendered (chapter heading present)", await px.evaluate(() =>
+  !!document.getElementById("content").querySelector("#ok-heading")));
+
+check("sanitizer: <script> element does not survive", await px.evaluate(() =>
+  document.getElementById("content").querySelector("script") === null));
+check("sanitizer: no onerror/onclick handler attribute survives", await px.evaluate(() => {
+  const c = document.getElementById("content");
+  return c.querySelector("[onerror]") === null && c.querySelector("[onclick]") === null;
+}));
+check("sanitizer: javascript: href does not survive", await px.evaluate(() => {
+  const a = document.getElementById("content").querySelector("#x-js");
+  return !a || !/^javascript:/i.test(a.getAttribute("href") || "");
+}));
+check("sanitizer: <iframe> does not survive", await px.evaluate(() =>
+  document.getElementById("content").querySelector("iframe") === null));
+
+// FORBID_TAGS / FORBID_ATTR are this repo's own config and differ from
+// markdown-viewer.us's, so they get assertions of their own.
+check("config: FORBID_TAGS strips style/form/input/button", await px.evaluate(() => {
+  const c = document.getElementById("content");
+  return ["style", "form", "input", "button"].every((t) => c.querySelector(t) === null);
+}));
+check("config: FORBID_ATTR strips style attributes", await px.evaluate(() =>
+  document.getElementById("content").querySelector("[style]") === null));
+
+// The uponSanitizeAttribute hook added in #1: remote resources must be stripped
+// before they reach the DOM, so a book cannot phone home just by being opened.
+check("hook: remote img src is stripped", await px.evaluate(() => {
+  const i = document.getElementById("content").querySelector("#x-remote");
+  return !i || !/^https?:/i.test(i.getAttribute("src") || "");
+}));
+check("hook: srcset is stripped entirely", await px.evaluate(() =>
+  document.getElementById("content").querySelector("[srcset]") === null));
+// POSITIVE: a data: image is allowed through -- the second assertion a
+// render-nothing failure cannot satisfy.
+check("hook: data: img src is preserved (not over-stripped)", await px.evaluate(() => {
+  const i = document.getElementById("content").querySelector("#x-data");
+  return !!i && /^data:image\/gif/.test(i.getAttribute("src") || "");
+}));
+
+await px.waitForTimeout(300);
+check("sanitizer: img onerror did not fire", await px.evaluate(() => window.__xssImg !== true));
+await ctxX.close();
 
 // -- static assertions
 const sz = (p) => (existsSync(join(ROOT, p)) ? statSync(join(ROOT, p)).size : 0);
