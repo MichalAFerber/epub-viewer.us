@@ -99,7 +99,7 @@ const zipStore = (entries) => {
 const HOSTILE_CHAPTER = `<?xml version="1.0" encoding="utf-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml"><head><title>Ch1</title></head><body>
 <h1 id="ok-heading">Chapter One</h1>
-<script>window.__xssScript = true;<\/script>
+<script>window.__xssScript = true;</script>
 <img id="x-onerror" src="missing.png" onerror="window.__xssImg = true"/>
 <a id="x-js" href="javascript:void(window.__xssHref = true)">js link</a>
 <iframe id="x-frame" src="about:blank"></iframe>

@@ -58,7 +58,7 @@
           tag !== "track" && tag !== "image" && tag !== "use") return;
       if (an === "src" || an === "poster" || an === "href" || an === "xlink:href"){
         // normalize the way URL parsers do: drop tabs/newlines anywhere and leading controls/space
-        var v = (data.attrValue || "").replace(/[\t\n\r]/g, "").replace(/^[\u0000-\u0020]+/, "");
+        var v = (data.attrValue || "").replace(/[\t\n\r]/g, "").replace(/^[\u0000-\u0020]+/, "") /* eslint-disable-line no-control-regex -- strip C0 before URL parse */;
         if (isExternal(v) && !/^data:/i.test(v)) data.keepAttr = false;
       }
     });
@@ -102,7 +102,7 @@
   }
   // scheme:, protocol-relative, data:, or fragment-only URLs are not zip paths
   function isExternal(href){
-    return /^(?:[a-z][a-z0-9+.\-]*:|\/\/)/i.test(href);
+    return /^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(href);
   }
 
   /* ---------- XML helpers (namespace-agnostic, EPUBs vary wildly) ---------- */
